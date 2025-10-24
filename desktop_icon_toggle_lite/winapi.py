@@ -212,6 +212,14 @@ class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+# 兼容缺失的 RECT 指针别名
+if not hasattr(wintypes, "LPRECT"):
+    wintypes.LPRECT = ctypes.POINTER(RECT)
+
+if not hasattr(wintypes, "LPCRECT"):
+    wintypes.LPCRECT = ctypes.POINTER(RECT)
+
+
 class MONITORINFO(ctypes.Structure):
     """显示器信息结构。"""
 
