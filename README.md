@@ -13,7 +13,8 @@
 * **桌面空白处双击**（可选）：仅在非全屏时启用低级鼠标钩子
 * **全屏自动避让**：无边框/缩放场景容差更友好
 * **自启动**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
-* **配置持久化**：`%APPDATA%\a6.DesktopIconToggleLite\config.json`
+* **可选自动检查更新**：GitHub Releases，新版本托盘提示
+* **配置持久化 + 日志记录**：`%APPDATA%\a6.DesktopIconToggleLite\`
 * **跨实例命令**：`toggle`（切换） / `exit`（退出）
 * **高 DPI**：Per-Monitor v2
 
@@ -94,6 +95,7 @@ dotnet publish -c Release -r win-arm64
 * **立即切换图标**：显隐桌面图标
 * **模式：热键（推荐）**：仅使用全局热键
 * **模式：桌面空白处双击**：开启低级鼠标钩子，非全屏时生效
+* **检查更新 / 启用自动检查更新**：查询 GitHub Releases，找到新版本会弹出托盘气泡提示
 * **开机自启**：写入/删除 `HKCU\...\Run`
 * **打开配置文件**：在记事本中打开 JSON
 * **退出**
@@ -110,6 +112,7 @@ dotnet publish -c Release -r win-arm64
 ## 配置
 
 路径：`%APPDATA%\a6.DesktopIconToggleLite\config.json`
+日志：`%APPDATA%\a6.DesktopIconToggleLite\log.txt`
 示例：
 
 ```json
@@ -118,7 +121,9 @@ dotnet publish -c Release -r win-arm64
   "Hotkey": "Ctrl+Alt+F1",
   "SuppressInFullscreen": true,
   "ShowTrayIcon": true,
-  "AutoStart": false
+  "AutoStart": false,
+  "CheckUpdates": true,
+  "FullscreenTolerance": 3
 }
 ```
 
@@ -129,6 +134,8 @@ dotnet publish -c Release -r win-arm64
 * `SuppressInFullscreen`：全屏时自动关闭双击钩子
 * `ShowTrayIcon`：是否显示托盘图标（`true` 建议保留，方便退出/设置）
 * `AutoStart`：是否开机自启（菜单操作优先，建议通过菜单切换）
+* `CheckUpdates`：是否开机后自动检查 GitHub Releases 新版本（手动点击菜单也会顺便开启）
+* `FullscreenTolerance`：全屏判定容差（像素），用于兼容无边框/缩放场景
 
 > 修改后：部分设置即时生效（如模式）；热键变更建议重启程序以确保稳定注册。
 
