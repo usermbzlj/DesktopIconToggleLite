@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desktop-icon-toggle-lite"
+version = "0.1.0"
+description = "Desktop icon visibility toggle rewritten in Python"
+authors = [{name = "a632079"}]
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: Microsoft :: Windows",
+]
+
+[project.urls]
+Homepage = "https://github.com/a632079/DesktopIconToggleLite"
+
+[project.scripts]
+desktop-icon-toggle-lite = "desktop_icon_toggle_lite.app:main"
