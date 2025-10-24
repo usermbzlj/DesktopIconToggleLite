@@ -9,6 +9,20 @@ from typing import Callable
 if not hasattr(ctypes, "WinDLL"):
     raise RuntimeError("仅支持在 Windows 平台运行")
 
+# 兼容不同 Python 版本中缺失的 Win32 类型定义
+_FALLBACK_WIN_TYPES: dict[str, type] = {
+    "HCURSOR": wintypes.HANDLE,
+    "HBRUSH": wintypes.HANDLE,
+    "HICON": wintypes.HANDLE,
+    "HMENU": wintypes.HANDLE,
+    "HHOOK": wintypes.HANDLE,
+    "HMONITOR": wintypes.HANDLE,
+}
+
+for _name, _ctype in _FALLBACK_WIN_TYPES.items():
+    if not hasattr(wintypes, _name):
+        setattr(wintypes, _name, _ctype)
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
