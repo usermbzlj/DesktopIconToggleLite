@@ -1,44 +1,34 @@
-// Desktop Icon Toggle Lite (C# .NET 8 WinForms)
-// Single-instance tray app with global hotkey + optional "desktop blank double-click".
-// Author: a6 (refactor request)
-// Target: Windows 10+
-// Build: see csproj below.
-//
-// Features vs original PS script:
-// - Single instance (mutex) + optional CLI signals (toggle/exit)
-// - Robust hotkey parsing & (un)register
-// - Optional low-level mouse hook, suspended in fullscreen
-// - Two ways to detect desktop listview: by cursor hit-test + fallback enumeration (Progman/WorkerW → SHELLDLL_DefView → SysListView32)
-// - Per-monitor DPI aware (PMv2)
-// - Config in %APPDATA%\a6.DesktopIconToggleLite\config.json
-// - AutoStart via HKCU\...\Run (no ExecutionPolicy/lnk/COM)
-// - Clean disposal on exit
+// 单文件入口，负责托盘逻辑、全局热键与桌面双击切换。
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using Timer = System.Windows.Forms.Timer;
 using Microsoft.Win32;
 
 internal static class App
 {
     public const string AppName = "Desktop Icon Toggle Lite";
-    public const string AppId   = "a6.DesktopIconToggleLite";
-    public static readonly string ConfigDir  = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppId);
+    public const string AppId = "a6.DesktopIconToggleLite";
+    public static readonly string ConfigDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), AppId);
     public static readonly string ConfigPath = Path.Combine(ConfigDir, "config.json");
+    public static readonly Version CurrentVersion = typeof(App).Assembly.GetName().Version ?? new Version(1, 0, 0, 0);
 
+    public static string? ConfigLoadError;
     public static Config Cfg = Config.Load(ConfigPath);
 
-    // Single instance
-    private static System.Threading.Mutex? _mtx;
+    private static Mutex? _mtx;
     private const string MutexName = "Global\\a6.DesktopIconToggleLite";
-
-    // Registered message for cross-instance signaling
     private static uint _uMsgToggle;
     private static uint _uMsgExit;
 
@@ -49,14 +39,13 @@ internal static class App
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
 
-        _mtx = new System.Threading.Mutex(initiallyOwned: true, name: MutexName, out bool createdNew);
+        _mtx = new Mutex(initiallyOwned: true, name: MutexName, out bool createdNew);
         if (!createdNew)
         {
-            // second instance: try to signal toggle/exit if requested
             if (args.Length > 0)
             {
                 _uMsgToggle = RegisterWindowMessage("A6_DITL_TOGGLE");
-                _uMsgExit   = RegisterWindowMessage("A6_DITL_EXIT");
+                _uMsgExit = RegisterWindowMessage("A6_DITL_EXIT");
 
                 IntPtr h = FindWindow(null, HiddenForm.WindowTitle);
                 if (h != IntPtr.Zero)
@@ -71,34 +60,55 @@ internal static class App
                     }
                 }
             }
-            // quit silently
             return;
         }
 
-        // Ensure config dir exists
-        try { Directory.CreateDirectory(ConfigDir); } catch { /* ignore */ }
-        // Save defaults on first run
-        if (!File.Exists(ConfigPath)) Cfg.Save(ConfigPath);
+        try
+        {
+            Directory.CreateDirectory(ConfigDir);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"创建配置目录失败：{ex.Message}");
+        }
+
+        bool isFirstRun = !File.Exists(ConfigPath);
+
+        Cfg.Normalize();
+        if (isFirstRun)
+        {
+            try
+            {
+                Cfg.Save(ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"首次保存默认配置失败：{ex.Message}");
+            }
+        }
 
         _uMsgToggle = RegisterWindowMessage("A6_DITL_TOGGLE");
-        _uMsgExit   = RegisterWindowMessage("A6_DITL_EXIT");
+        _uMsgExit = RegisterWindowMessage("A6_DITL_EXIT");
 
-        using var ctx = new TrayContext(_uMsgToggle, _uMsgExit);
+        using var ctx = new TrayContext(_uMsgToggle, _uMsgExit, isFirstRun);
         Application.Run(ctx);
 
         _mtx.ReleaseMutex();
         _mtx.Dispose();
     }
 
-    // ---------- Config ----------
     internal sealed class Config
     {
         [JsonConverter(typeof(JsonStringEnumConverter))]
-        public RunMode Mode { get; set; } = RunMode.Hotkey; // Hotkey or DesktopDoubleClick
+        public RunMode Mode { get; set; } = RunMode.Hotkey;
         public string Hotkey { get; set; } = "Ctrl+Alt+F1";
-        public bool   SuppressInFullscreen { get; set; } = true;
-        public bool   ShowTrayIcon { get; set; } = true;
-        public bool   AutoStart    { get; set; } = false;
+        public bool SuppressInFullscreen { get; set; } = true;
+        public bool ShowTrayIcon { get; set; } = true;
+        public bool AutoStart { get; set; } = false;
+        public bool CheckUpdates { get; set; } = false;
+        public int FullscreenTolerance { get; set; } = 3;
+        public bool ShowToggleToast { get; set; } = true;
+        public bool ShowFirstRunGuide { get; set; } = true;
 
         public static Config Load(string path)
         {
@@ -108,17 +118,40 @@ internal static class App
                 {
                     var json = File.ReadAllText(path);
                     var cfg = JsonSerializer.Deserialize<Config>(json, JsonOptions());
-                    if (cfg != null) return cfg;
+                    if (cfg != null)
+                    {
+                        cfg.Normalize();
+                        return cfg;
+                    }
                 }
             }
-            catch { /* ignore */ }
-            return new Config();
+            catch (Exception ex)
+            {
+                ConfigLoadError = $"配置读取失败：{ex.Message}";
+                Log.Error("读取配置时发生异常", ex);
+            }
+
+            var fallback = new Config();
+            fallback.Normalize();
+            return fallback;
         }
 
         public void Save(string path)
         {
             var json = JsonSerializer.Serialize(this, JsonOptions());
-            File.WriteAllText(path, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            File.WriteAllText(path, json, new UTF8Encoding(false));
+        }
+
+        public void Normalize()
+        {
+            if (string.IsNullOrWhiteSpace(Hotkey))
+            {
+                Hotkey = "Ctrl+Alt+F1";
+            }
+            if (FullscreenTolerance < 0 || FullscreenTolerance > 50)
+            {
+                FullscreenTolerance = 3;
+            }
         }
 
         private static JsonSerializerOptions JsonOptions() => new()
@@ -136,57 +169,78 @@ internal static class App
         DesktopDoubleClick
     }
 
-    // ---------- ApplicationContext / Tray ----------
     private sealed class TrayContext : ApplicationContext
     {
         private readonly NotifyIcon _tray;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _miToggle;
+        private readonly ToolStripMenuItem _miGuide;
         private readonly ToolStripMenuItem _miModeHotkey;
         private readonly ToolStripMenuItem _miModeDbl;
         private readonly ToolStripMenuItem _miAutoStart;
-        private readonly ToolStripMenuItem _miExit;
         private readonly ToolStripMenuItem _miOpenConfig;
+        private readonly ToolStripMenuItem _miExit;
+        private readonly ToolStripMenuItem _miUpdate;
+        private readonly ToolStripMenuItem _miBalloon;
+        private readonly ToolStripMenuItem _miReset;
 
-        private readonly HiddenForm _wnd; // message sink + hotkey window
+        private readonly HiddenForm _wnd;
         private readonly Timer _hookTimer;
         private IntPtr _mouseHook = IntPtr.Zero;
         private Native.LowLevelMouseProc? _mouseProc;
 
         private DateTime _lastClick = DateTime.MinValue;
-        private IntPtr   _lastHwnd  = IntPtr.Zero;
+        private IntPtr _lastHwnd = IntPtr.Zero;
         private Native.POINT _lastPt;
 
         private readonly uint _msgToggle;
         private readonly uint _msgExit;
+        private readonly EventHandler _hotkeyHandler;
+        private readonly SynchronizationContext? _syncContext;
+        private string? _latestReleaseUrl;
+        private string? _latestReleaseTag;
+        private readonly bool _isFirstRun;
+        private bool _lastIconVisible;
 
-        public TrayContext(uint msgToggle, uint msgExit)
+        public TrayContext(uint msgToggle, uint msgExit, bool isFirstRun)
         {
             _msgToggle = msgToggle;
             _msgExit = msgExit;
+            _syncContext = SynchronizationContext.Current;
+            _isFirstRun = isFirstRun;
 
-            // message sink window
+            _lastIconVisible = AreDesktopIconsVisible();
+
             _wnd = new HiddenForm(_msgToggle, _msgExit);
+            _hotkeyHandler = (_, _) => ToggleDesktopIcons();
+            _wnd.HotkeyPressed += _hotkeyHandler;
             _wnd.ToggleRequested += (_, _) => ToggleDesktopIcons();
-            _wnd.ExitRequested   += (_, _) => ExitApp();
+            _wnd.ExitRequested += (_, _) => ExitApp();
 
-            // tray menu
             _menu = new ContextMenuStrip();
             _miToggle = new ToolStripMenuItem("立即切换图标", null, (_, __) => ToggleDesktopIcons());
+            _miGuide = new ToolStripMenuItem("使用小白指南", null, (_, __) => ShowGuideDialog(false));
+            _miUpdate = new ToolStripMenuItem("检查更新", null, OnUpdateMenuClick) { Visible = false };
             _miModeHotkey = new ToolStripMenuItem("模式：热键（推荐）", null, (_, __) => { App.Cfg.Mode = RunMode.Hotkey; PersistAndRefresh(); });
-            _miModeDbl    = new ToolStripMenuItem("模式：桌面空白处双击", null, (_, __) => { App.Cfg.Mode = RunMode.DesktopDoubleClick; PersistAndRefresh(); });
-            _miAutoStart  = new ToolStripMenuItem("开机自启", null, (_, __) => { ToggleAutoStart(); });
+            _miModeDbl = new ToolStripMenuItem("模式：桌面空白处双击", null, (_, __) => { App.Cfg.Mode = RunMode.DesktopDoubleClick; PersistAndRefresh(); });
+            _miAutoStart = new ToolStripMenuItem("开机自启", null, (_, __) => { ToggleAutoStart(); });
+            _miBalloon = new ToolStripMenuItem("切换时显示提示", null, (_, __) => ToggleBalloon());
+            _miReset = new ToolStripMenuItem("恢复默认设置", null, (_, __) => ResetConfig());
             _miOpenConfig = new ToolStripMenuItem("打开配置文件", null, (_, __) => OpenConfig());
-            _miExit       = new ToolStripMenuItem("退出", null, (_, __) => ExitApp());
+            _miExit = new ToolStripMenuItem("退出", null, (_, __) => ExitApp());
 
             _menu.Items.AddRange(new ToolStripItem[]
             {
                 _miToggle,
+                _miGuide,
+                _miUpdate,
                 new ToolStripSeparator(),
                 _miModeHotkey,
                 _miModeDbl,
                 new ToolStripSeparator(),
+                _miBalloon,
                 _miAutoStart,
+                _miReset,
                 _miOpenConfig,
                 new ToolStripSeparator(),
                 _miExit
@@ -201,47 +255,213 @@ internal static class App
             };
             _tray.MouseClick += (_, e) =>
             {
-                if (e.Button == MouseButtons.Left) ToggleDesktopIcons();
+                if (e.Button == MouseButtons.Left)
+                {
+                    ToggleDesktopIcons();
+                }
             };
 
-            // hotkey
             RegisterHotkeyOrWarn();
 
-            // mouse hook timer (start/stop based on mode + fullscreen)
             _hookTimer = new Timer { Interval = 1200 };
             _hookTimer.Tick += (_, __) => UpdateMouseHookState();
             _hookTimer.Start();
 
-            RefreshMenuChecks();
             EnsureAutoStartState();
+            RefreshMenuChecks();
+            UpdateTrayText();
+            NotifyConfigLoadError();
+            StartUpdateCheck();
+            ShowFirstRunGuideIfNeeded();
+        }
+
+        private void NotifyConfigLoadError()
+        {
+            if (!string.IsNullOrEmpty(ConfigLoadError))
+            {
+                MessageBox.Show(ConfigLoadError, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                ConfigLoadError = null;
+            }
+        }
+
+        private void ShowFirstRunGuideIfNeeded()
+        {
+            if (!_isFirstRun && !App.Cfg.ShowFirstRunGuide)
+            {
+                return;
+            }
+
+            ShowGuideDialog(true);
+        }
+
+        private void ShowGuideDialog(bool allowHotkeyPrompt)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("欢迎使用 Desktop Icon Toggle Lite！");
+            sb.AppendLine();
+            sb.AppendLine("• 默认热键为 Ctrl+Alt+F1，可随时修改。");
+            sb.AppendLine("• 也可以改为双击桌面空白处触发，菜单中即可切换模式。");
+            sb.AppendLine("• 右键托盘图标可以打开配置文件或启用开机自启。");
+            sb.AppendLine("• 如需帮助，日志与配置均保存在应用数据目录。");
+
+            string message = sb.ToString();
+            DialogResult result = DialogResult.No;
+            if (allowHotkeyPrompt)
+            {
+                message += "\n是否现在设置一个更顺手的热键？选择“是”后直接按下想要的组合键。";
+                result = MessageBox.Show(message, "新手指南", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(message, "新手指南", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+
+            if (allowHotkeyPrompt)
+            {
+                App.Cfg.ShowFirstRunGuide = false;
+                PersistConfig(true);
+                RefreshMenuChecks();
+                UpdateTrayText();
+            }
+
+            if (allowHotkeyPrompt && result == DialogResult.Yes)
+            {
+                TryCaptureHotkeyFromUser();
+            }
         }
 
         private void PersistAndRefresh()
         {
-            try { App.Cfg.Save(App.ConfigPath); } catch { /* ignore */ }
+            PersistConfig(false);
             RefreshMenuChecks();
             UpdateMouseHookState();
+            UpdateTrayText();
+        }
+
+        private void PersistConfig(bool silent)
+        {
+            try
+            {
+                App.Cfg.Normalize();
+                App.Cfg.Save(App.ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("保存配置失败", ex);
+                if (!silent)
+                {
+                    MessageBox.Show($"保存配置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+            }
         }
 
         private void RefreshMenuChecks()
         {
             _miModeHotkey.Checked = App.Cfg.Mode == RunMode.Hotkey;
-            _miModeDbl.Checked    = App.Cfg.Mode == RunMode.DesktopDoubleClick;
-            _miAutoStart.Checked  = IsAutoStartEnabled();
+            _miModeDbl.Checked = App.Cfg.Mode == RunMode.DesktopDoubleClick;
+            _miAutoStart.Checked = IsAutoStartEnabled();
+            _miBalloon.Checked = App.Cfg.ShowToggleToast;
+            _miReset.Enabled = !(App.Cfg.Mode == RunMode.Hotkey
+                                  && App.Cfg.Hotkey == "Ctrl+Alt+F1"
+                                  && App.Cfg.SuppressInFullscreen
+                                  && App.Cfg.AutoStart == false
+                                  && App.Cfg.CheckUpdates == false
+                                  && App.Cfg.FullscreenTolerance == 3
+                                  && App.Cfg.ShowToggleToast);
+            _miUpdate.Visible = true;
+            if (!string.IsNullOrEmpty(_latestReleaseUrl) && !string.IsNullOrEmpty(_latestReleaseTag))
+            {
+                _miUpdate.Text = $"下载新版本：{_latestReleaseTag}";
+            }
+            else
+            {
+                _miUpdate.Text = App.Cfg.CheckUpdates ? "检查更新" : "启用自动检查更新";
+            }
         }
 
         private void ToggleAutoStart()
         {
             try
             {
-                if (IsAutoStartEnabled()) DisableAutoStart();
-                else EnableAutoStart();
+                if (IsAutoStartEnabled())
+                {
+                    DisableAutoStart();
+                    App.Cfg.AutoStart = false;
+                }
+                else
+                {
+                    EnableAutoStart();
+                    App.Cfg.AutoStart = true;
+                }
+                PersistConfig(false);
             }
             catch (Exception ex)
             {
+                Log.Error("自启动配置失败", ex);
                 MessageBox.Show($"自启动配置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             RefreshMenuChecks();
+        }
+
+        private void ToggleBalloon()
+        {
+            App.Cfg.ShowToggleToast = !App.Cfg.ShowToggleToast;
+            PersistAndRefresh();
+        }
+
+        private void ResetConfig()
+        {
+            var confirm = MessageBox.Show("将恢复为默认设置（包含热键和提示），是否继续？", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            App.Cfg = new Config();
+            App.Cfg.Normalize();
+
+            try
+            {
+                App.Cfg.Save(App.ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("恢复默认设置时保存失败", ex);
+                MessageBox.Show($"恢复默认设置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                if (IsAutoStartEnabled())
+                {
+                    DisableAutoStart();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"尝试关闭自启动失败：{ex.Message}");
+            }
+
+            RegisterHotkeyOrWarn();
+            RefreshMenuChecks();
+            UpdateMouseHookState();
+            _lastIconVisible = AreDesktopIconsVisible();
+            UpdateTrayText();
+
+            MessageBox.Show("已恢复默认设置，下面将再次展示新手指南。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ShowGuideDialog(true);
+        }
+
+        private void EnsureAutoStartState()
+        {
+            bool actual = IsAutoStartEnabled();
+            if (App.Cfg.AutoStart != actual)
+            {
+                Log.Warn($"检测到自启动配置不一致，已将配置更新为 {actual}");
+                App.Cfg.AutoStart = actual;
+                PersistConfig(true);
+            }
         }
 
         private static string RunRegPath => @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -254,11 +474,13 @@ internal static class App
             var val = rk?.GetValue(RunRegName) as string;
             return !string.IsNullOrEmpty(val);
         }
+
         private static void EnableAutoStart()
         {
             using var rk = Registry.CurrentUser.OpenSubKey(RunRegPath, true) ?? Registry.CurrentUser.CreateSubKey(RunRegPath, true);
             rk.SetValue(RunRegName, $"\"{ExePath}\"");
         }
+
         private static void DisableAutoStart()
         {
             using var rk = Registry.CurrentUser.OpenSubKey(RunRegPath, true);
@@ -270,42 +492,167 @@ internal static class App
             try
             {
                 Directory.CreateDirectory(App.ConfigDir);
-                if (!File.Exists(App.ConfigPath)) App.Cfg.Save(App.ConfigPath);
+                if (!File.Exists(App.ConfigPath))
+                {
+                    App.Cfg.Save(App.ConfigPath);
+                }
                 Process.Start(new ProcessStartInfo("notepad.exe", $"\"{App.ConfigPath}\"") { UseShellExecute = false });
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"打开配置失败：{ex.Message}", AppName);
+                Log.Error("打开配置文件失败", ex);
+                MessageBox.Show($"打开配置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
         }
 
         private void RegisterHotkeyOrWarn()
         {
-            if (!_wnd.TryRegisterHotkey(App.Cfg.Hotkey))
+            if (_wnd.TryRegisterHotkey(App.Cfg.Hotkey, out string? error))
             {
-                MessageBox.Show($"注册全局热键失败：{App.Cfg.Hotkey}\n请在配置中更换组合键后重启。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
+                Log.Info($"注册全局热键成功：{App.Cfg.Hotkey}");
+                UpdateTrayText();
+                return;
             }
-            else
+
+            Log.Warn($"注册全局热键失败：{error}");
+            var dialog = MessageBox.Show($"注册全局热键失败：{App.Cfg.Hotkey}\n{error}\n是否现在选择新的组合键？", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (dialog == DialogResult.Yes)
             {
-                _wnd.HotkeyPressed += (_, __) => ToggleDesktopIcons();
+                if (TryCaptureHotkeyFromUser())
+                {
+                    return;
+                }
             }
+
+            MessageBox.Show("热键注册失败，暂时只能通过托盘菜单切换桌面图标。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            UpdateTrayText();
+        }
+
+        private bool TryCaptureHotkeyFromUser()
+        {
+            using var capture = new HotkeyCaptureForm(App.Cfg.Hotkey);
+            if (capture.ShowDialog() != DialogResult.OK || string.IsNullOrWhiteSpace(capture.ResultHotkey))
+            {
+                return false;
+            }
+
+            App.Cfg.Hotkey = capture.ResultHotkey;
+            PersistConfig(false);
+
+            if (_wnd.TryRegisterHotkey(App.Cfg.Hotkey, out string? retryError))
+            {
+                Log.Info($"新的全局热键注册成功：{App.Cfg.Hotkey}");
+                RefreshMenuChecks();
+                UpdateTrayText();
+                return true;
+            }
+
+            Log.Warn($"新的全局热键注册失败：{retryError}");
+            MessageBox.Show($"新的全局热键注册失败：{retryError}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
         }
 
         private void UpdateMouseHookState()
         {
             bool wantHook = App.Cfg.Mode == RunMode.DesktopDoubleClick;
-            if (App.Cfg.SuppressInFullscreen && Native.IsFullscreenForeground()) wantHook = false;
+            if (App.Cfg.SuppressInFullscreen && IsFullscreenForeground(App.Cfg.FullscreenTolerance))
+            {
+                wantHook = false;
+            }
 
             if (wantHook && _mouseHook == IntPtr.Zero)
             {
                 _mouseProc = MouseProc;
                 _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc!, IntPtr.Zero, 0);
+                if (_mouseHook == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    Log.Warn($"注册鼠标钩子失败，错误码：{error}");
+                }
+                else
+                {
+                    Log.Info("低级鼠标钩子已启用");
+                }
             }
             else if (!wantHook && _mouseHook != IntPtr.Zero)
             {
-                Native.UnhookWindowsHookEx(_mouseHook);
-                _mouseHook = IntPtr.Zero;
+                ReleaseMouseHook();
             }
+        }
+
+        private void ToggleDesktopIcons()
+        {
+            bool before = AreDesktopIconsVisible();
+            if (!TrySendToggleCommand())
+            {
+                Log.Warn("尝试切换桌面图标时未找到目标窗口");
+                MessageBox.Show("切换桌面图标失败，请确认资源管理器正常运行后再试。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool after = AreDesktopIconsVisible();
+            Log.Info(after ? "桌面图标切换为显示" : "桌面图标切换为隐藏");
+            if (before == after)
+            {
+                Log.Warn("切换桌面图标后状态未变化，可能被其他程序阻止");
+            }
+
+            ShowFriendlyToggleResult(after);
+        }
+
+        private void ShowFriendlyToggleResult(bool iconsVisibleNow)
+        {
+            _lastIconVisible = iconsVisibleNow;
+            UpdateTrayText();
+
+            if (!App.Cfg.ShowToggleToast)
+            {
+                return;
+            }
+
+            string stateText = iconsVisibleNow ? "桌面图标已显示" : "桌面图标已隐藏";
+            string hint = App.Cfg.Mode == RunMode.Hotkey
+                ? $"快捷键：{App.Cfg.Hotkey}"
+                : "提示：双击桌面空白处可切换";
+            _tray.BalloonTipTitle = AppName;
+            _tray.BalloonTipText = $"{stateText}\n{hint}";
+            _tray.ShowBalloonTip(3000);
+        }
+
+        private void UpdateTrayText()
+        {
+            string stateText = _lastIconVisible ? "图标：已显示" : "图标：已隐藏";
+            string modeText = App.Cfg.Mode == RunMode.Hotkey ? $"热键：{App.Cfg.Hotkey}" : "操作：桌面双击";
+            string tooltip = $"{AppName}\n{stateText}，{modeText}";
+            if (tooltip.Length > 63)
+            {
+                tooltip = tooltip.Substring(0, 63);
+            }
+            _tray.Text = tooltip;
+        }
+
+        private void ReleaseMouseHook()
+        {
+            if (_mouseHook == IntPtr.Zero)
+            {
+                return;
+            }
+
+            for (int i = 0; i < 3; i++)
+            {
+                if (Native.UnhookWindowsHookEx(_mouseHook))
+                {
+                    _mouseHook = IntPtr.Zero;
+                    _mouseProc = null;
+                    Log.Info("低级鼠标钩子已释放");
+                    return;
+                }
+                Thread.Sleep(50);
+            }
+
+            Log.Warn("低级鼠标钩子释放失败，将放弃句柄并继续退出");
+            _mouseHook = IntPtr.Zero;
+            _mouseProc = null;
         }
 
         private IntPtr MouseProc(int nCode, IntPtr wParam, IntPtr lParam)
@@ -330,7 +677,14 @@ internal static class App
                 {
                     if (TestDesktopBlankHit())
                     {
-                        try { ToggleDesktopIcons(); } catch { /* ignore */ }
+                        try
+                        {
+                            ToggleDesktopIcons();
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Error("桌面空白双击触发切换失败", ex);
+                        }
                     }
                     _lastClick = DateTime.MinValue;
                     _lastHwnd = IntPtr.Zero;
@@ -350,9 +704,11 @@ internal static class App
             IntPtr lv = GetDesktopListViewFromCursor();
             if (lv == IntPtr.Zero)
             {
-                // fallback to enumeration (Progman/WorkerW → SHELLDLL_DefView → SysListView32)
                 lv = GetDesktopListViewEnumerate();
-                if (lv == IntPtr.Zero) return false;
+                if (lv == IntPtr.Zero)
+                {
+                    return false;
+                }
             }
 
             Native.POINT ptScreen;
@@ -381,7 +737,10 @@ internal static class App
             for (int i = 0; i < 10 && cur != IntPtr.Zero; i++)
             {
                 var cls = GetClassName(cur);
-                if (cls == "SysListView32") return cur;
+                if (cls == "SysListView32")
+                {
+                    return cur;
+                }
                 cur = Native.GetParent(cur);
             }
             return IntPtr.Zero;
@@ -389,7 +748,6 @@ internal static class App
 
         private static IntPtr GetDesktopListViewEnumerate()
         {
-            // Find SHELLDLL_DefView under Progman or WorkerW
             IntPtr defView = Native.FindWindowEx(Native.FindWindow("Progman", null), IntPtr.Zero, "SHELLDLL_DefView", null);
             if (defView == IntPtr.Zero)
             {
@@ -397,10 +755,16 @@ internal static class App
                 while ((workerW = Native.FindWindowEx(IntPtr.Zero, workerW, "WorkerW", null)) != IntPtr.Zero)
                 {
                     defView = Native.FindWindowEx(workerW, IntPtr.Zero, "SHELLDLL_DefView", null);
-                    if (defView != IntPtr.Zero) break;
+                    if (defView != IntPtr.Zero)
+                    {
+                        break;
+                    }
                 }
             }
-            if (defView == IntPtr.Zero) return IntPtr.Zero;
+            if (defView == IntPtr.Zero)
+            {
+                return IntPtr.Zero;
+            }
             IntPtr lv = Native.FindWindowEx(defView, IntPtr.Zero, "SysListView32", null);
             return lv;
         }
@@ -412,44 +776,295 @@ internal static class App
             return sb.ToString();
         }
 
-        private static void ToggleDesktopIcons()
+        private static bool TrySendToggleCommand()
         {
-            // Primary approach: send WM_COMMAND 0x7402 to Progman (Explorer processes it)
             IntPtr prog = Native.FindWindow("Progman", null);
             if (prog != IntPtr.Zero)
             {
                 Native.SendMessage(prog, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
-                return;
+                return true;
             }
-            // Fallback: send to SHELLDLL_DefView parent
-            IntPtr defView = Native.FindWindowEx(Native.FindWindow("Progman", null), IntPtr.Zero, "SHELLDLL_DefView", null);
-            if (defView != IntPtr.Zero)
+
+            IntPtr shell = Native.FindWindow("Progman", null);
+            if (shell == IntPtr.Zero)
             {
-                IntPtr parent = Native.GetParent(defView);
-                if (parent != IntPtr.Zero)
-                    Native.SendMessage(parent, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
+                return false;
             }
+
+            IntPtr defView = Native.FindWindowEx(shell, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (defView == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            IntPtr parent = Native.GetParent(defView);
+            if (parent == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            Native.SendMessage(parent, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
+            return true;
+        }
+
+        private static bool AreDesktopIconsVisible()
+        {
+            IntPtr listView = GetDesktopListViewEnumerate();
+            return listView == IntPtr.Zero || Native.IsWindowVisible(listView);
         }
 
         private void ExitApp()
         {
             try
             {
-                if (_mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(_mouseHook);
+                _hookTimer.Stop();
             }
-            catch { }
-            try { _tray.Visible = false; _tray.Dispose(); } catch { }
-            try { _wnd.Dispose(); } catch { }
+            catch
+            {
+            }
+
+            try
+            {
+                ReleaseMouseHook();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"释放鼠标钩子时出现异常：{ex.Message}");
+            }
+
+            try
+            {
+                _tray.Visible = false;
+                _tray.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"托盘图标释放失败：{ex.Message}");
+            }
+
+            try
+            {
+                _wnd.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"隐藏窗口释放失败：{ex.Message}");
+            }
+
             Application.ExitThread();
+        }
+
+        private void StartUpdateCheck()
+        {
+            if (!App.Cfg.CheckUpdates)
+            {
+                return;
+            }
+            Task.Run(async () => await CheckForUpdatesAsync());
+        }
+
+        private void StartManualUpdateCheck()
+        {
+            if (!App.Cfg.CheckUpdates)
+            {
+                App.Cfg.CheckUpdates = true;
+                PersistConfig(false);
+                RefreshMenuChecks();
+            }
+            Task.Run(async () => await CheckForUpdatesAsync(true));
+        }
+
+        private async Task CheckForUpdatesAsync(bool fromUser = false)
+        {
+            try
+            {
+                using var client = new HttpClient();
+                client.DefaultRequestHeaders.UserAgent.ParseAdd("DesktopIconToggleLite/1.0");
+                using var resp = await client.GetAsync("https://api.github.com/repos/a6computing/DesktopIconToggleLite/releases/latest");
+                resp.EnsureSuccessStatusCode();
+
+                using var stream = await resp.Content.ReadAsStreamAsync();
+                using var doc = await JsonDocument.ParseAsync(stream);
+                if (!doc.RootElement.TryGetProperty("tag_name", out var tag))
+                {
+                    return;
+                }
+                string? tagName = tag.GetString();
+                string? url = doc.RootElement.TryGetProperty("html_url", out var html) ? html.GetString() : null;
+                if (string.IsNullOrWhiteSpace(tagName))
+                {
+                    return;
+                }
+                string cleaned = tagName.TrimStart('v', 'V');
+                if (!Version.TryParse(cleaned, out var remote))
+                {
+                    return;
+                }
+                if (remote > CurrentVersion)
+                {
+                    Log.Info($"检测到新版本：{tagName}");
+                    _latestReleaseUrl = url;
+                    _syncContext?.Post(_ => ShowUpdateNotice(tagName), null);
+                }
+                else
+                {
+                    _latestReleaseUrl = null;
+                    _latestReleaseTag = null;
+                    _syncContext?.Post(_ =>
+                    {
+                        RefreshMenuChecks();
+                        if (fromUser)
+                        {
+                            MessageBox.Show("当前已是最新版本。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                    }, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"检查更新失败：{ex.Message}");
+                if (fromUser)
+                {
+                    _syncContext?.Post(_ => MessageBox.Show($"检查更新失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning), null);
+                }
+            }
+        }
+
+        private void ShowUpdateNotice(string tagName)
+        {
+            _latestReleaseTag = tagName;
+            _miUpdate.Visible = true;
+            RefreshMenuChecks();
+            _tray.BalloonTipTitle = AppName;
+            _tray.BalloonTipText = $"发现新版本 {tagName}，请通过托盘菜单下载。";
+            _tray.ShowBalloonTip(5000);
+        }
+
+        private void OnUpdateMenuClick(object? sender, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(_latestReleaseUrl))
+            {
+                StartManualUpdateCheck();
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo(_latestReleaseUrl) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("打开新版本链接失败", ex);
+                MessageBox.Show($"无法打开浏览器：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         protected override void Dispose(bool disposing)
         {
             base.Dispose(disposing);
         }
+
+        private sealed class HotkeyCaptureForm : Form
+        {
+            private readonly Label _label;
+            private readonly Button _btnOk;
+            private readonly Button _btnCancel;
+            private string _captured = string.Empty;
+
+            public string ResultHotkey => _captured;
+
+            public HotkeyCaptureForm(string current)
+            {
+                Text = "选择新的全局热键";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                StartPosition = FormStartPosition.CenterScreen;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                Width = 420;
+                Height = 180;
+                KeyPreview = true;
+                TopMost = true;
+
+                _label = new Label
+                {
+                    Dock = DockStyle.Top,
+                    Height = 60,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Text = $"请按下新的热键组合（例如 Ctrl+Alt+F1），当前配置：{current}"
+                };
+
+                _btnOk = new Button
+                {
+                    Text = "确定",
+                    Dock = DockStyle.Left,
+                    DialogResult = DialogResult.OK,
+                    Enabled = false,
+                    Width = 200
+                };
+                _btnOk.Click += (_, _) =>
+                {
+                    if (string.IsNullOrWhiteSpace(_captured))
+                    {
+                        DialogResult = DialogResult.Cancel;
+                    }
+                };
+
+                _btnCancel = new Button
+                {
+                    Text = "取消",
+                    Dock = DockStyle.Right,
+                    DialogResult = DialogResult.Cancel,
+                    Width = 200
+                };
+
+                var panel = new Panel { Dock = DockStyle.Bottom, Height = 40 };
+                panel.Controls.Add(_btnOk);
+                panel.Controls.Add(_btnCancel);
+
+                Controls.Add(panel);
+                Controls.Add(_label);
+
+                AcceptButton = _btnOk;
+                CancelButton = _btnCancel;
+            }
+
+            protected override void OnKeyDown(KeyEventArgs e)
+            {
+                base.OnKeyDown(e);
+                e.SuppressKeyPress = true;
+
+                if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.Menu || e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+                {
+                    return;
+                }
+
+                var parts = new List<string>();
+                if (e.Control)
+                {
+                    parts.Add("Ctrl");
+                }
+                if (e.Alt)
+                {
+                    parts.Add("Alt");
+                }
+                if (e.Shift)
+                {
+                    parts.Add("Shift");
+                }
+                if ((e.Modifiers & Keys.LWin) == Keys.LWin || (e.Modifiers & Keys.RWin) == Keys.RWin)
+                {
+                    parts.Add("Win");
+                }
+
+                string keyName = e.KeyCode.ToString();
+                parts.Add(keyName);
+
+                _captured = string.Join("+", parts);
+                _label.Text = $"已捕获：{_captured}";
+                _btnOk.Enabled = true;
+            }
+        }
     }
 
-    // ---------- Hidden window for hotkey & messages ----------
     private sealed class HiddenForm : Form
     {
         public const string WindowTitle = "A6.DesktopIconToggleLite";
@@ -466,8 +1081,9 @@ internal static class App
             Text = WindowTitle;
             ShowInTaskbar = false;
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
-            Opacity = 0; // truly hidden
-            Width = 0; Height = 0;
+            Opacity = 0;
+            Width = 0;
+            Height = 0;
             _msgToggle = msgToggle;
             _msgExit = msgExit;
         }
@@ -475,21 +1091,29 @@ internal static class App
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
-            // keep hidden
             Hide();
         }
 
-        public bool TryRegisterHotkey(string hk)
+        public bool TryRegisterHotkey(string hk, out string? errorMessage)
         {
+            errorMessage = null;
             try
             {
                 ParseHotkey(hk, out int mod, out int vk);
                 Native.UnregisterHotKey(Handle, _hotId);
                 if (!Native.RegisterHotKey(Handle, _hotId, mod, vk))
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    errorMessage = $"系统错误码：{err}";
                     return false;
+                }
                 return true;
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+                return false;
+            }
         }
 
         protected override void WndProc(ref Message m)
@@ -511,50 +1135,68 @@ internal static class App
 
         protected override void Dispose(bool disposing)
         {
-            try { Native.UnregisterHotKey(Handle, _hotId); } catch { }
+            try
+            {
+                Native.UnregisterHotKey(Handle, _hotId);
+            }
+            catch
+            {
+            }
             base.Dispose(disposing);
         }
 
-        // "Ctrl+Alt+F1" / "Ctrl+Shift+D" / "Win+Space" / "Alt+NumPad0"
         private static void ParseHotkey(string s, out int mod, out int vk)
         {
-            mod = 0; vk = 0;
+            mod = 0;
+            vk = 0;
 
-            foreach (var raw in s.Split('+'))
+            var parts = s.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var p in parts)
             {
-                string p = raw.Trim();
-                if (p.Equals("Ctrl", StringComparison.OrdinalIgnoreCase)) { mod |= Native.MOD_CONTROL; continue; }
-                if (p.Equals("Alt",  StringComparison.OrdinalIgnoreCase)) { mod |= Native.MOD_ALT;      continue; }
-                if (p.Equals("Shift",StringComparison.OrdinalIgnoreCase)) { mod |= Native.MOD_SHIFT;    continue; }
-                if (p.Equals("Win",  StringComparison.OrdinalIgnoreCase)) { mod |= Native.MOD_WIN;      continue; }
+                switch (p.ToLowerInvariant())
+                {
+                    case "ctrl":
+                        mod |= Native.MOD_CONTROL;
+                        continue;
+                    case "alt":
+                        mod |= Native.MOD_ALT;
+                        continue;
+                    case "shift":
+                        mod |= Native.MOD_SHIFT;
+                        continue;
+                    case "win":
+                        mod |= Native.MOD_WIN;
+                        continue;
+                }
 
-                // try Keys enum
-                if (Enum.TryParse<Keys>(p, true, out var k) && k != Keys.None)
+                if (Enum.TryParse(p, true, out Keys key)
+                    && key != Keys.ControlKey
+                    && key != Keys.Menu
+                    && key != Keys.ShiftKey
+                    && key != Keys.LWin
+                    && key != Keys.RWin)
                 {
-                    vk = (int)k;
+                    vk = (int)key;
                     continue;
                 }
-                // F1..F24
-                var f = System.Text.RegularExpressions.Regex.Match(p, @"^[Ff](\d{1,2})$");
-                if (f.Success && int.TryParse(f.Groups[1].Value, out int n) && n >= 1 && n <= 24)
-                {
-                    vk = (int)Keys.F1 + (n - 1);
-                    continue;
-                }
-                // Single letter/digit
+
                 if (p.Length == 1)
                 {
                     char ch = char.ToUpperInvariant(p[0]);
-                    vk = ch; // VK for 'A'..'Z' or '0'..'9'
+                    vk = ch;
                     continue;
                 }
+
                 throw new ArgumentException($"未知键：{p}");
             }
-            if (vk == 0) throw new ArgumentException("未指定主键（如 F1）");
+
+            if (vk == 0)
+            {
+                throw new ArgumentException("未指定主键（如 F1）");
+            }
         }
     }
 
-    // ---------- Native P/Invoke ----------
     private static class Native
     {
         public const int WM_HOTKEY = 0x0312;
@@ -572,7 +1214,11 @@ internal static class App
         public const int LVM_HITTEST = LVM_FIRST + 18;
 
         [StructLayout(LayoutKind.Sequential)]
-        public struct POINT { public int X; public int Y; }
+        public struct POINT
+        {
+            public int X;
+            public int Y;
+        }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct LVHITTESTINFO
@@ -585,7 +1231,13 @@ internal static class App
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        public struct RECT { public int Left, Top, Right, Bottom; }
+        public struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct MONITORINFO
@@ -598,8 +1250,8 @@ internal static class App
 
         public delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
-        [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
         [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
         [DllImport("user32.dll", SetLastError = true)] public static extern bool UnhookWindowsHookEx(IntPtr hhk);
@@ -614,6 +1266,7 @@ internal static class App
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
@@ -623,7 +1276,6 @@ internal static class App
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern uint RegisterWindowMessage(string lpString);
     }
 
-    // ---------- Helpers ----------
     private static uint RegisterWindowMessage(string name) => Native.RegisterWindowMessage(name);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -637,22 +1289,56 @@ internal static class App
         public const uint MONITOR_DEFAULTTONEAREST = 2;
     }
 
-    internal static bool IsFullscreenForeground()
+    internal static bool IsFullscreenForeground(int tolerance)
     {
         IntPtr fg = Native.GetForegroundWindow();
-        if (fg == IntPtr.Zero) return false;
-        if (!Native.GetWindowRect(fg, out var r)) return false;
+        if (fg == IntPtr.Zero)
+        {
+            return false;
+        }
+        if (!Native.GetWindowRect(fg, out var r))
+        {
+            return false;
+        }
 
         IntPtr mon = Native.MonitorFromWindow(fg, NativeExt.MONITOR_DEFAULTTONEAREST);
         var mi = new Native.MONITORINFO { cbSize = Marshal.SizeOf<Native.MONITORINFO>() };
-        if (!Native.GetMonitorInfo(mon, ref mi)) return false;
+        if (!Native.GetMonitorInfo(mon, ref mi))
+        {
+            return false;
+        }
 
         int w = r.Right - r.Left;
         int h = r.Bottom - r.Top;
         int mw = mi.rcMonitor.Right - mi.rcMonitor.Left;
         int mh = mi.rcMonitor.Bottom - mi.rcMonitor.Top;
 
-        // Allow 3px tolerance to reduce false negatives in borderless / scaling scenarios.
-        return Math.Abs(w - mw) <= 3 && Math.Abs(h - mh) <= 3;
+        return Math.Abs(w - mw) <= tolerance && Math.Abs(h - mh) <= tolerance;
+    }
+
+    internal static class Log
+    {
+        private static readonly object SyncRoot = new();
+        private static string LogPath => Path.Combine(ConfigDir, "log.txt");
+
+        public static void Info(string message) => Write("INFO", message);
+        public static void Warn(string message) => Write("WARN", message);
+        public static void Error(string message, Exception ex) => Write("ERROR", $"{message} | {ex}");
+
+        private static void Write(string level, string message)
+        {
+            try
+            {
+                Directory.CreateDirectory(ConfigDir);
+                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [{level}] {message}";
+                lock (SyncRoot)
+                {
+                    File.AppendAllText(LogPath, line + Environment.NewLine, new UTF8Encoding(false));
+                }
+            }
+            catch
+            {
+            }
+        }
     }
 }
