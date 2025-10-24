@@ -15,6 +15,7 @@
 * **自启动**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
 * **可选自动检查更新**：GitHub Releases，新版本托盘提示
 * **配置持久化 + 日志记录**：`%APPDATA%\a6.DesktopIconToggleLite\`
+* **新手友好提示**：首次运行弹出图文指南，切换时可显示气泡提示
 * **跨实例命令**：`toggle`（切换） / `exit`（退出）
 * **高 DPI**：Per-Monitor v2
 
@@ -47,8 +48,8 @@
 ## 快速上手
 
 1. 下载/编译 `DesktopIconToggleLite.exe`
-2. 双击运行（首次运行会生成配置文件）
-3. 托盘右键菜单可切换模式/设置自启动/打开配置
+2. 双击运行（首次运行会生成配置文件并弹出新手指南）
+3. 托盘右键菜单可切换模式/设置自启动/打开配置/重看指南
 
 > **左键点击托盘图标** = 立即显隐桌面图标
 
@@ -93,10 +94,13 @@ dotnet publish -c Release -r win-arm64
 ### 托盘菜单
 
 * **立即切换图标**：显隐桌面图标
+* **使用小白指南**：随时重看新手提示或重新设置热键
 * **模式：热键（推荐）**：仅使用全局热键
 * **模式：桌面空白处双击**：开启低级鼠标钩子，非全屏时生效
+* **切换时显示提示**：是否在每次切换后弹出托盘气泡
 * **检查更新 / 启用自动检查更新**：查询 GitHub Releases，找到新版本会弹出托盘气泡提示
 * **开机自启**：写入/删除 `HKCU\...\Run`
+* **恢复默认设置**：一键还原默认热键与全部选项
 * **打开配置文件**：在记事本中打开 JSON
 * **退出**
 
@@ -123,7 +127,9 @@ dotnet publish -c Release -r win-arm64
   "ShowTrayIcon": true,
   "AutoStart": false,
   "CheckUpdates": true,
-  "FullscreenTolerance": 3
+  "FullscreenTolerance": 3,
+  "ShowToggleToast": true,
+  "ShowFirstRunGuide": false
 }
 ```
 
@@ -136,6 +142,8 @@ dotnet publish -c Release -r win-arm64
 * `AutoStart`：是否开机自启（菜单操作优先，建议通过菜单切换）
 * `CheckUpdates`：是否开机后自动检查 GitHub Releases 新版本（手动点击菜单也会顺便开启）
 * `FullscreenTolerance`：全屏判定容差（像素），用于兼容无边框/缩放场景
+* `ShowToggleToast`：切换桌面图标后是否显示托盘气泡提示
+* `ShowFirstRunGuide`：是否在启动时展示新手指南（重置设置后会再次启用）
 
 > 修改后：部分设置即时生效（如模式）；热键变更建议重启程序以确保稳定注册。
 

@@ -71,8 +71,10 @@ internal static class App
             Log.Warn($"创建配置目录失败：{ex.Message}");
         }
 
+        bool isFirstRun = !File.Exists(ConfigPath);
+
         Cfg.Normalize();
-        if (!File.Exists(ConfigPath))
+        if (isFirstRun)
         {
             try
             {
@@ -87,7 +89,7 @@ internal static class App
         _uMsgToggle = RegisterWindowMessage("A6_DITL_TOGGLE");
         _uMsgExit = RegisterWindowMessage("A6_DITL_EXIT");
 
-        using var ctx = new TrayContext(_uMsgToggle, _uMsgExit);
+        using var ctx = new TrayContext(_uMsgToggle, _uMsgExit, isFirstRun);
         Application.Run(ctx);
 
         _mtx.ReleaseMutex();
@@ -104,6 +106,8 @@ internal static class App
         public bool AutoStart { get; set; } = false;
         public bool CheckUpdates { get; set; } = false;
         public int FullscreenTolerance { get; set; } = 3;
+        public bool ShowToggleToast { get; set; } = true;
+        public bool ShowFirstRunGuide { get; set; } = true;
 
         public static Config Load(string path)
         {
@@ -169,12 +173,15 @@ internal static class App
         private readonly NotifyIcon _tray;
         private readonly ContextMenuStrip _menu;
         private readonly ToolStripMenuItem _miToggle;
+        private readonly ToolStripMenuItem _miGuide;
         private readonly ToolStripMenuItem _miModeHotkey;
         private readonly ToolStripMenuItem _miModeDbl;
         private readonly ToolStripMenuItem _miAutoStart;
         private readonly ToolStripMenuItem _miOpenConfig;
         private readonly ToolStripMenuItem _miExit;
         private readonly ToolStripMenuItem _miUpdate;
+        private readonly ToolStripMenuItem _miBalloon;
+        private readonly ToolStripMenuItem _miReset;
 
         private readonly HiddenForm _wnd;
         private readonly Timer _hookTimer;
@@ -191,12 +198,17 @@ internal static class App
         private readonly SynchronizationContext? _syncContext;
         private string? _latestReleaseUrl;
         private string? _latestReleaseTag;
+        private readonly bool _isFirstRun;
+        private bool _lastIconVisible;
 
-        public TrayContext(uint msgToggle, uint msgExit)
+        public TrayContext(uint msgToggle, uint msgExit, bool isFirstRun)
         {
             _msgToggle = msgToggle;
             _msgExit = msgExit;
             _syncContext = SynchronizationContext.Current;
+            _isFirstRun = isFirstRun;
+
+            _lastIconVisible = AreDesktopIconsVisible();
 
             _wnd = new HiddenForm(_msgToggle, _msgExit);
             _hotkeyHandler = (_, _) => ToggleDesktopIcons();
@@ -206,22 +218,28 @@ internal static class App
 
             _menu = new ContextMenuStrip();
             _miToggle = new ToolStripMenuItem("立即切换图标", null, (_, __) => ToggleDesktopIcons());
+            _miGuide = new ToolStripMenuItem("使用小白指南", null, (_, __) => ShowGuideDialog(false));
             _miUpdate = new ToolStripMenuItem("检查更新", null, OnUpdateMenuClick) { Visible = false };
             _miModeHotkey = new ToolStripMenuItem("模式：热键（推荐）", null, (_, __) => { App.Cfg.Mode = RunMode.Hotkey; PersistAndRefresh(); });
             _miModeDbl = new ToolStripMenuItem("模式：桌面空白处双击", null, (_, __) => { App.Cfg.Mode = RunMode.DesktopDoubleClick; PersistAndRefresh(); });
             _miAutoStart = new ToolStripMenuItem("开机自启", null, (_, __) => { ToggleAutoStart(); });
+            _miBalloon = new ToolStripMenuItem("切换时显示提示", null, (_, __) => ToggleBalloon());
+            _miReset = new ToolStripMenuItem("恢复默认设置", null, (_, __) => ResetConfig());
             _miOpenConfig = new ToolStripMenuItem("打开配置文件", null, (_, __) => OpenConfig());
             _miExit = new ToolStripMenuItem("退出", null, (_, __) => ExitApp());
 
             _menu.Items.AddRange(new ToolStripItem[]
             {
                 _miToggle,
+                _miGuide,
                 _miUpdate,
                 new ToolStripSeparator(),
                 _miModeHotkey,
                 _miModeDbl,
                 new ToolStripSeparator(),
+                _miBalloon,
                 _miAutoStart,
+                _miReset,
                 _miOpenConfig,
                 new ToolStripSeparator(),
                 _miExit
@@ -250,8 +268,10 @@ internal static class App
 
             EnsureAutoStartState();
             RefreshMenuChecks();
+            UpdateTrayText();
             NotifyConfigLoadError();
             StartUpdateCheck();
+            ShowFirstRunGuideIfNeeded();
         }
 
         private void NotifyConfigLoadError()
@@ -263,11 +283,58 @@ internal static class App
             }
         }
 
+        private void ShowFirstRunGuideIfNeeded()
+        {
+            if (!_isFirstRun && !App.Cfg.ShowFirstRunGuide)
+            {
+                return;
+            }
+
+            ShowGuideDialog(true);
+        }
+
+        private void ShowGuideDialog(bool allowHotkeyPrompt)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("欢迎使用 Desktop Icon Toggle Lite！");
+            sb.AppendLine();
+            sb.AppendLine("• 默认热键为 Ctrl+Alt+F1，可随时修改。");
+            sb.AppendLine("• 也可以改为双击桌面空白处触发，菜单中即可切换模式。");
+            sb.AppendLine("• 右键托盘图标可以打开配置文件或启用开机自启。");
+            sb.AppendLine("• 如需帮助，日志与配置均保存在应用数据目录。");
+
+            string message = sb.ToString();
+            DialogResult result = DialogResult.No;
+            if (allowHotkeyPrompt)
+            {
+                message += "\n是否现在设置一个更顺手的热键？选择“是”后直接按下想要的组合键。";
+                result = MessageBox.Show(message, "新手指南", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(message, "新手指南", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+
+            if (allowHotkeyPrompt)
+            {
+                App.Cfg.ShowFirstRunGuide = false;
+                PersistConfig(true);
+                RefreshMenuChecks();
+                UpdateTrayText();
+            }
+
+            if (allowHotkeyPrompt && result == DialogResult.Yes)
+            {
+                TryCaptureHotkeyFromUser();
+            }
+        }
+
         private void PersistAndRefresh()
         {
             PersistConfig(false);
             RefreshMenuChecks();
             UpdateMouseHookState();
+            UpdateTrayText();
         }
 
         private void PersistConfig(bool silent)
@@ -292,6 +359,14 @@ internal static class App
             _miModeHotkey.Checked = App.Cfg.Mode == RunMode.Hotkey;
             _miModeDbl.Checked = App.Cfg.Mode == RunMode.DesktopDoubleClick;
             _miAutoStart.Checked = IsAutoStartEnabled();
+            _miBalloon.Checked = App.Cfg.ShowToggleToast;
+            _miReset.Enabled = !(App.Cfg.Mode == RunMode.Hotkey
+                                  && App.Cfg.Hotkey == "Ctrl+Alt+F1"
+                                  && App.Cfg.SuppressInFullscreen
+                                  && App.Cfg.AutoStart == false
+                                  && App.Cfg.CheckUpdates == false
+                                  && App.Cfg.FullscreenTolerance == 3
+                                  && App.Cfg.ShowToggleToast);
             _miUpdate.Visible = true;
             if (!string.IsNullOrEmpty(_latestReleaseUrl) && !string.IsNullOrEmpty(_latestReleaseTag))
             {
@@ -325,6 +400,56 @@ internal static class App
                 MessageBox.Show($"自启动配置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
             RefreshMenuChecks();
+        }
+
+        private void ToggleBalloon()
+        {
+            App.Cfg.ShowToggleToast = !App.Cfg.ShowToggleToast;
+            PersistAndRefresh();
+        }
+
+        private void ResetConfig()
+        {
+            var confirm = MessageBox.Show("将恢复为默认设置（包含热键和提示），是否继续？", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            App.Cfg = new Config();
+            App.Cfg.Normalize();
+
+            try
+            {
+                App.Cfg.Save(App.ConfigPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Error("恢复默认设置时保存失败", ex);
+                MessageBox.Show($"恢复默认设置失败：{ex.Message}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                if (IsAutoStartEnabled())
+                {
+                    DisableAutoStart();
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn($"尝试关闭自启动失败：{ex.Message}");
+            }
+
+            RegisterHotkeyOrWarn();
+            RefreshMenuChecks();
+            UpdateMouseHookState();
+            _lastIconVisible = AreDesktopIconsVisible();
+            UpdateTrayText();
+
+            MessageBox.Show("已恢复默认设置，下面将再次展示新手指南。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            ShowGuideDialog(true);
         }
 
         private void EnsureAutoStartState()
@@ -384,6 +509,7 @@ internal static class App
             if (_wnd.TryRegisterHotkey(App.Cfg.Hotkey, out string? error))
             {
                 Log.Info($"注册全局热键成功：{App.Cfg.Hotkey}");
+                UpdateTrayText();
                 return;
             }
 
@@ -391,24 +517,38 @@ internal static class App
             var dialog = MessageBox.Show($"注册全局热键失败：{App.Cfg.Hotkey}\n{error}\n是否现在选择新的组合键？", AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question);
             if (dialog == DialogResult.Yes)
             {
-                using var capture = new HotkeyCaptureForm(App.Cfg.Hotkey);
-                if (capture.ShowDialog() == DialogResult.OK && !string.IsNullOrWhiteSpace(capture.ResultHotkey))
+                if (TryCaptureHotkeyFromUser())
                 {
-                    App.Cfg.Hotkey = capture.ResultHotkey;
-                    PersistConfig(false);
-                    if (_wnd.TryRegisterHotkey(App.Cfg.Hotkey, out string? retryError))
-                    {
-                        Log.Info($"新的全局热键注册成功：{App.Cfg.Hotkey}");
-                        return;
-                    }
-                    Log.Warn($"新的全局热键注册失败：{retryError}");
-                    MessageBox.Show($"新的全局热键注册失败：{retryError}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
                 }
             }
-            else
+
+            MessageBox.Show("热键注册失败，暂时只能通过托盘菜单切换桌面图标。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            UpdateTrayText();
+        }
+
+        private bool TryCaptureHotkeyFromUser()
+        {
+            using var capture = new HotkeyCaptureForm(App.Cfg.Hotkey);
+            if (capture.ShowDialog() != DialogResult.OK || string.IsNullOrWhiteSpace(capture.ResultHotkey))
             {
-                MessageBox.Show("热键注册失败，暂时只能通过托盘菜单切换桌面图标。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
             }
+
+            App.Cfg.Hotkey = capture.ResultHotkey;
+            PersistConfig(false);
+
+            if (_wnd.TryRegisterHotkey(App.Cfg.Hotkey, out string? retryError))
+            {
+                Log.Info($"新的全局热键注册成功：{App.Cfg.Hotkey}");
+                RefreshMenuChecks();
+                UpdateTrayText();
+                return true;
+            }
+
+            Log.Warn($"新的全局热键注册失败：{retryError}");
+            MessageBox.Show($"新的全局热键注册失败：{retryError}", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
         }
 
         private void UpdateMouseHookState()
@@ -437,6 +577,57 @@ internal static class App
             {
                 ReleaseMouseHook();
             }
+        }
+
+        private void ToggleDesktopIcons()
+        {
+            bool before = AreDesktopIconsVisible();
+            if (!TrySendToggleCommand())
+            {
+                Log.Warn("尝试切换桌面图标时未找到目标窗口");
+                MessageBox.Show("切换桌面图标失败，请确认资源管理器正常运行后再试。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            bool after = AreDesktopIconsVisible();
+            Log.Info(after ? "桌面图标切换为显示" : "桌面图标切换为隐藏");
+            if (before == after)
+            {
+                Log.Warn("切换桌面图标后状态未变化，可能被其他程序阻止");
+            }
+
+            ShowFriendlyToggleResult(after);
+        }
+
+        private void ShowFriendlyToggleResult(bool iconsVisibleNow)
+        {
+            _lastIconVisible = iconsVisibleNow;
+            UpdateTrayText();
+
+            if (!App.Cfg.ShowToggleToast)
+            {
+                return;
+            }
+
+            string stateText = iconsVisibleNow ? "桌面图标已显示" : "桌面图标已隐藏";
+            string hint = App.Cfg.Mode == RunMode.Hotkey
+                ? $"快捷键：{App.Cfg.Hotkey}"
+                : "提示：双击桌面空白处可切换";
+            _tray.BalloonTipTitle = AppName;
+            _tray.BalloonTipText = $"{stateText}\n{hint}";
+            _tray.ShowBalloonTip(3000);
+        }
+
+        private void UpdateTrayText()
+        {
+            string stateText = _lastIconVisible ? "图标：已显示" : "图标：已隐藏";
+            string modeText = App.Cfg.Mode == RunMode.Hotkey ? $"热键：{App.Cfg.Hotkey}" : "操作：桌面双击";
+            string tooltip = $"{AppName}\n{stateText}，{modeText}";
+            if (tooltip.Length > 63)
+            {
+                tooltip = tooltip.Substring(0, 63);
+            }
+            _tray.Text = tooltip;
         }
 
         private void ReleaseMouseHook()
@@ -584,23 +775,41 @@ internal static class App
             return sb.ToString();
         }
 
-        private static void ToggleDesktopIcons()
+        private static bool TrySendToggleCommand()
         {
             IntPtr prog = Native.FindWindow("Progman", null);
             if (prog != IntPtr.Zero)
             {
                 Native.SendMessage(prog, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
-                return;
+                return true;
             }
-            IntPtr defView = Native.FindWindowEx(Native.FindWindow("Progman", null), IntPtr.Zero, "SHELLDLL_DefView", null);
-            if (defView != IntPtr.Zero)
+
+            IntPtr shell = Native.FindWindow("Progman", null);
+            if (shell == IntPtr.Zero)
             {
-                IntPtr parent = Native.GetParent(defView);
-                if (parent != IntPtr.Zero)
-                {
-                    Native.SendMessage(parent, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
-                }
+                return false;
             }
+
+            IntPtr defView = Native.FindWindowEx(shell, IntPtr.Zero, "SHELLDLL_DefView", null);
+            if (defView == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            IntPtr parent = Native.GetParent(defView);
+            if (parent == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            Native.SendMessage(parent, Native.WM_COMMAND, (IntPtr)0x7402, IntPtr.Zero);
+            return true;
+        }
+
+        private static bool AreDesktopIconsVisible()
+        {
+            IntPtr listView = GetDesktopListViewEnumerate();
+            return listView == IntPtr.Zero || Native.IsWindowVisible(listView);
         }
 
         private void ExitApp()
@@ -779,7 +988,7 @@ internal static class App
                     Dock = DockStyle.Top,
                     Height = 60,
                     TextAlign = ContentAlignment.MiddleCenter,
-                    Text = $"请按下新的热键组合，当前配置：{current}"
+                    Text = $"请按下新的热键组合（例如 Ctrl+Alt+F1），当前配置：{current}"
                 };
 
                 _btnOk = new Button
@@ -1056,6 +1265,7 @@ internal static class App
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, ref LVHITTESTINFO lParam);
         [DllImport("user32.dll")] public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
