@@ -9,6 +9,41 @@ from typing import Callable
 if not hasattr(ctypes, "WinDLL"):
     raise RuntimeError("仅支持在 Windows 平台运行")
 
+# 兼容不同 Python 版本中缺失的 Win32 类型定义
+def _ptr_sized_unsigned() -> type:
+    """根据指针位数返回无符号整数类型。"""
+
+    return ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+def _ptr_sized_signed() -> type:
+    """根据指针位数返回有符号整数类型。"""
+
+    return ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+
+
+_FALLBACK_WIN_TYPES: dict[str, type] = {
+    "HCURSOR": wintypes.HANDLE,
+    "HBRUSH": wintypes.HANDLE,
+    "HICON": wintypes.HANDLE,
+    "HMENU": wintypes.HANDLE,
+    "HHOOK": wintypes.HANDLE,
+    "HMONITOR": wintypes.HANDLE,
+    "UINT_PTR": _ptr_sized_unsigned(),
+    "ULONG_PTR": _ptr_sized_unsigned(),
+    "DWORD_PTR": _ptr_sized_unsigned(),
+    "WPARAM": _ptr_sized_unsigned(),
+    "LONG_PTR": _ptr_sized_signed(),
+    "INT_PTR": _ptr_sized_signed(),
+    "LRESULT": _ptr_sized_signed(),
+    "REGSAM": wintypes.DWORD,
+    "LPSECURITY_ATTRIBUTES": ctypes.c_void_p,
+}
+
+for _name, _ctype in _FALLBACK_WIN_TYPES.items():
+    if not hasattr(wintypes, _name):
+        setattr(wintypes, _name, _ctype)
+
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -175,6 +210,14 @@ class RECT(ctypes.Structure):
     """矩形结构。"""
 
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+# 兼容缺失的 RECT 指针别名
+if not hasattr(wintypes, "LPRECT"):
+    wintypes.LPRECT = ctypes.POINTER(RECT)
+
+if not hasattr(wintypes, "LPCRECT"):
+    wintypes.LPCRECT = ctypes.POINTER(RECT)
 
 
 class MONITORINFO(ctypes.Structure):
